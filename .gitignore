@@ -1,0 +1,9 @@
+# Auth — never commit
+.divoom_token
+.env
+*.token
+
+# Local generated files
+dashboard_preview.*
+__pycache__/
+*.pyc
