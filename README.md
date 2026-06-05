@@ -6,6 +6,8 @@ Notes from a one-evening attempt to push a custom dashboard image to a Divoom **
 
 If you finish the missing piece, please open a PR — this is exactly where someone with mitmproxy and an iPhone could close the loop in an hour.
 
+> **Correction to the original "pure-cloud" claim:** the frame *does* expose a local LAN HTTP API on `:9000/divoom_api` — see [Local HTTP API on :9000](#local-http-api-on-9000-partial) below. It controls brightness / screen / built-in faces / danmaku, but **not** the photo-bind step, so it doesn't shorten the missing piece. Full session log: `HANDOFF.md`.
+
 ---
 
 ## What works ✅
@@ -41,11 +43,43 @@ If true, the public HTTP API will *never* expose an attach-photo method, by desi
 1. **mitmproxy** the official Android/iOS app, capture exactly what happens when you upload a photo from the gallery, copy that flow.
 2. If SSL pinning blocks step 1: Frida bypass on a rooted Android emulator, or APK decompilation.
 
+## Local HTTP API on :9000 (partial)
+
+**Found 2026-05, re-confirmed 2026-06.** The frame exposes a local HTTP command API on the LAN. Credit to **Vasily Simanin** (`vsimanin`, issue #1), whose Home Assistant integration first used it. The original April writeup wrongly called the device "pure-cloud" because the endpoint is an unusual **GET-with-JSON-body** to `:9000/divoom_api` (not Pixoo's `:80/post`), so a naive port scan slips past it.
+
+- **Transport:** `http://<frame-ip>:9000/divoom_api`, JSON body `{"Command": "...", ...}`. Same Divoom JSON-RPC family as Pixoo, different port + path.
+- **No auth, LAN only.** The frame answers with its own `DeviceId` and `DeviceType: "Frame"`.
+- **Unimplemented-command baseline:** `{"ReturnCode": 1, "ReturnMessage": "Only accept JSON parameters"}`. Verified as a catch-all — a garbage command, an empty object, and a request with no `Command` field all return it. So this reply means "not routed by the firmware", **not** "needs more params".
+
+### Implemented locally (return `ReturnCode: 0`)
+
+| Command | Payload | Notes |
+|---|---|---|
+| `Channel/GetConfig` | — | `RotationFlag, ClockTime, GalleryTime, SingleGalleyTime, ChannelIndex, StartUpClockId, GalleryShowTimeFlag` |
+| `Channel/GetClockInfo` | — | `Brightness, ClockId` |
+| `Channel/GetOnOffScreen` | — | `OnOff` |
+| `Channel/GetAmbientLight` | — | `Brightness, Color, ColorCycle, EqOnOff, SelectEffect` |
+| `Channel/GetEqPosition` | — | `EqPosition` |
+| `Device/GetWeatherInfo` | — | `Weather, CurTemp, MinTemp, MaxTemp, Pressure, …` |
+| `Channel/SetClockSelectId` | `{ClockId}` | switch built-in face (write) |
+| `Channel/SetBrightness` | `{Brightness 0..100}` | write |
+| `Channel/OnOffScreen` | `{OnOff 0\|1}` | screen on/off (write) |
+| `Device/SysReboot` | — | reboot (write) |
+| `Danmaku/SendText` | `{DeviceId, Text, TextColor, UserId}` | **POST**, not GET |
+| `Device/EnterCustomControlMode` / `ExitCustomControlMode` | — | accepted; effect unclear, screen unchanged |
+| `Draw/ResetHttpGifId`, `Draw/SendHttpGif`, `Draw/GetHttpGifId` | Pixoo pixel-buffer format | **accepted** (`ReturnCode 0`) but not visible: targets a draw channel, and channel-switching (`Channel/SetIndex`) is *not* implemented locally, so you can't bring it on screen via the API. Even if shown it's a ~64px pixel buffer, not a full-screen photo. |
+
+### NOT implemented locally
+
+Photo/playlist control is absent. ~920 probes across `Photo/*`, `PhotoFrame/*`, `Picture/*`, `Image/*`, `File/*`, `Cloud/*`, `Slideshow/*`, `Gallery/*`, `Channel/*` × `{Add, Set, Push, Insert, Bind, Sync, Update, Play, Show, …}` with a real `FileId` all hit the catch-all baseline. Channel switching (`Channel/SetIndex` / `GetIndex`) is also absent.
+
+**Conclusion:** the local API controls brightness / screen / built-in faces / danmaku / a custom-control mode — but **not** the bind-FileId-to-playlist step. That still lives in the cloud / RongCloud channel; the local API does not shorten the missing piece. The mitmproxy path below remains the way to finish.
+
+> **IP note:** the frame's LAN IP moves with DHCP (seen at `.65` → `.66` → `.64` across sessions). Reserve it by MAC in the router. To find it: scan `:9000` and check which host returns `DeviceType: "Frame"` to `Channel/GetConfig`.
+
 ## Why this device, not Pixoo
 
-The Pixoo line (Pixoo 16/64) has a fully open local HTTP API on port 80 — there are dozens of libraries, Home Assistant integrations, the works. **Times Frame doesn't expose anything locally** (we scanned all common ports — only `Libuhttpd` on 9000, no useful endpoints). It's pure-cloud.
-
-That's a deliberate Divoom decision: Times Frame is sold as a no-subscription premium photo frame for non-technical users. Locking everything behind their app keeps the experience simple and protects the bundle. Open-source community hasn't reverse-engineered it yet because the addressable audience of hackers-who-bought-this-device is small.
+The Pixoo line (Pixoo 16/64) has a fully open local HTTP API on port 80 — dozens of libraries, Home Assistant integrations, the works. Times Frame exposes a **narrower** local API (above): screen/brightness/faces yes, photo control no. The photo experience is deliberately cloud-locked — Times Frame is sold as a no-subscription premium photo frame for non-technical users, and keeping the gallery behind their app protects the bundle. The open-source community hasn't fully cracked it yet because the addressable audience of hackers-who-bought-this-device is small.
 
 ## Use the toolkit
 
@@ -80,7 +114,11 @@ Token is cached in `.divoom_token` (gitignored). Email lives in `DIVOOM_EMAIL` e
 
 ## File map
 
-* `divoom_cloud.py` — CLI: login, info, list, upload, probe-attach
+* `divoom_cloud.py` — cloud CLI: login, info, list, upload, probe-attach
+* `divoom_local.py` — local `:9000/divoom_api` CLI: `info`, `call`, `probe`
+* `divoom_timesframe.py`, `divoom_dashboard.py`, `divoom-dashboard-prompt.md` — dashboard-image generation experiments
+* `probe_test.jpg` — 800×1280 test image for CDN upload
+* `HANDOFF.md` — full session log (2026-05 physical-frame session + co-op notes)
 * `.gitignore` — excludes `.divoom_token`
 * `README.md` — this file
 
@@ -95,3 +133,5 @@ Token is cached in `.divoom_token` (gitignored). Email lives in `DIVOOM_EMAIL` e
 | `appin.divoom-gz.com` | `/PhotoFrame/UploadFile` | POST | — | ⚠️ 200 OK but `protected method` (internal only) |
 | `appin.divoom-gz.com` | `/PhotoFrame/{Add,Save,Set,…}Photo` | POST | — | ❌ `Command is not match` (~160 variants tried) |
 | `f.divoom-gz.com` | `/upload.php` | POST multipart, field `upFile` | **none** | ✅ returns `FileId` |
+| `<frame-ip>:9000` | `/divoom_api` (`Channel/Get*`, `OnOffScreen`, `SetBrightness`, `Draw/*`, `Danmaku/SendText`) | GET/POST + JSON body | **none (LAN)** | ✅ local control subset (screen/brightness/faces/danmaku) |
+| `<frame-ip>:9000` | `/divoom_api` photo/playlist bind (`Photo/*`, `Cloud/*`, `Channel/SetIndex`, …) | GET/POST + JSON body | — | ❌ catch-all baseline (~920 variants tried) — not local |
